@@ -2,8 +2,8 @@
     "https://connect.ncifcrf.gov": {
         "server_url": "https://connect.ncifcrf.gov",
         "filename": "/home/presleydc/shiny_apps/shiny_python",
-        "app_url": "https://connect.ncifcrf.gov/content/3c8a4ff0-0877-4152-9832-2cc07f77534e/",
-        "app_id": "10",
+        "app_url": "https://connect.ncifcrf.gov/shiny-python/",
+        "app_id": "3c8a4ff0-0877-4152-9832-2cc07f77534e",
         "app_guid": "3c8a4ff0-0877-4152-9832-2cc07f77534e",
         "title": "shiny_python",
         "app_mode": "python-shiny",

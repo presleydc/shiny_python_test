@@ -69,6 +69,22 @@ def server(input, output, session):
     })
     job_output_content = reactive.Value("")
 
+    # Define the Slurm job script content directly in Python
+    # IMPORTANT: The --output and --error paths here must match what read_slurm_logs expects.
+    # We are setting them to the current directory here.
+    job_script_template = """#!/bin/bash
+#SBATCH --job-name=ShinyEmbeddedJob
+#SBATCH --output=shiny_sleep_job_%j.out   # Output to current directory
+#SBATCH --error=shiny_sleep_job_%j.err    # Error to current directory
+#SBATCH --time=0-00:01:00  # 1 minute max run time
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+
+echo "Slurm job started on $(hostname) at $(date)"
+sleep 30
+echo "Slurm job finished on $(hostname) at $(date)"
+"""
+
     @output
     @render.text
     def job_status_display():
@@ -99,9 +115,17 @@ def server(input, output, session):
         job_info.set({"status": "No job launched", "start_time": None, "end_time": None, "job_id": None, "hostname": "N/A"})
         job_output_content.set("Attempting to launch Slurm job...")
 
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        job_script_path = os.path.join(script_dir, "shiny_generated_job.sh") # New name for the generated script
+        
+        current_job_id = None # Initialize to None
+
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            job_script_path = os.path.join(script_dir, "job.sh")
+            # Write the embedded script content to a file
+            with open(job_script_path, "w") as f:
+                f.write(job_script_template)
+            
+            # Make the script executable
             os.chmod(job_script_path, 0o755)
 
             sbatch_command = ["sbatch", "--parsable", job_script_path]
@@ -115,18 +139,24 @@ def server(input, output, session):
             stdout, stderr = await process.communicate()
 
             if process.returncode == 0:
-                job_id = stdout.decode().strip()
-                print(f"Slurm job submitted with ID: {job_id}")
+                current_job_id = stdout.decode().strip() # Store the job ID
+                print(f"Slurm job submitted with ID: {current_job_id}")
 
-                # Initial state after submission: job_status_display remains "No job launched"
-                # Details in job_output
-                job_output_content.set(f"Slurm job ID: {job_id}\nJob status: Pending.\nPolling for job completion and node information...")
+                # Update job_info with the current job ID
+                job_info.set({
+                    "status": "No job launched", # job_status_display remains "No job launched"
+                    "start_time": datetime.now(),
+                    "end_time": None,
+                    "job_id": current_job_id,
+                    "hostname": "N/A" # Still N/A until it runs
+                })
+                job_output_content.set(f"Slurm job ID: {current_job_id}\nJob status: Pending.\nPolling for job completion and node information...")
 
                 # Polling for job completion and node info
                 last_known_hostname = "N/A"
                 while True:
                     # Check job state and assigned node
-                    check_command = ["squeue", "-h", "-j", job_id, "-o", "%T %N"] # Get state and node
+                    check_command = ["squeue", "-h", "-j", current_job_id, "-o", "%T %N"] # Get state and node
                     check_process = await asyncio.create_subprocess_exec(
                         *check_command,
                         stdout=asyncio.subprocess.PIPE,
@@ -150,15 +180,15 @@ def server(input, output, session):
                             "status": "Job running", # Updates job_status_display
                             "start_time": job_info.get()["start_time"] if job_info.get()["start_time"] else datetime.now(), # Ensure start_time is set
                             "end_time": None,
-                            "job_id": job_id,
+                            "job_id": current_job_id,
                             "hostname": last_known_hostname if last_known_hostname != "N/A" else "Unknown Node"
                         })
-                        job_output_content.set(f"Slurm job ID: {job_id}\nCurrently running on: {job_info.get()['hostname']}\nMonitoring job status and output...")
+                        job_output_content.set(f"Slurm job ID: {current_job_id}\nCurrently running on: {job_info.get()['hostname']}\nMonitoring job status and output...")
                     elif job_state == "PENDING":
                         # job_status_display stays "No job launched"
-                        job_output_content.set(f"Slurm job ID: {job_id}\nJob status: Pending. Waiting for allocation...")
+                        job_output_content.set(f"Slurm job ID: {current_job_id}\nJob status: Pending. Waiting for allocation...")
                     elif not job_state: # Job no longer in squeue, check sacct for final state
-                        sacct_command = ["sacct", "-j", job_id, "--format=State", "-n", "-P"]
+                        sacct_command = ["sacct", "-j", current_job_id, "--format=State", "-n", "-P"]
                         sacct_process = await asyncio.create_subprocess_exec(
                             *sacct_command,
                             stdout=asyncio.subprocess.PIPE,
@@ -170,40 +200,40 @@ def server(input, output, session):
                         # Extract the first pipe-separated field and clean it thoroughly
                         final_state = final_state_raw.split('|')[0].strip().upper() if final_state_raw else "UNKNOWN"
 
-                        print(f"DEBUG: Job {job_id} final_state extracted: '{final_state}' (repr: {repr(final_state)})") # For debugging
+                        print(f"DEBUG: Job {current_job_id} final_state extracted: '{final_state}' (repr: {repr(final_state)})") # For debugging
 
                         # --- Read log files for final display (both .out and .err) ---
-                        logs_combined_content = await read_slurm_logs(job_id)
+                        logs_combined_content = await read_slurm_logs(current_job_id)
 
                         if final_state == "COMPLETED":
                             job_info.set({
                                 "status": "Job completed", # Updates job_status_display
                                 "start_time": job_info.get()["start_time"],
                                 "end_time": datetime.now(),
-                                "job_id": job_id,
+                                "job_id": current_job_id,
                                 "hostname": last_known_hostname
                             })
-                            job_output_content.set(f"Slurm job {job_id} completed successfully.\n\n{logs_combined_content}")
+                            job_output_content.set(f"Slurm job {current_job_id} completed successfully.\n\n{logs_combined_content}")
                         # Check for known failure/termination states
                         elif final_state in ["FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "PREEMPTED", "OUT_OF_MEMORY"]:
                             job_info.set({
                                 "status": "No job launched", # Resets job_status_display to default
                                 "start_time": job_info.get()["start_time"],
                                 "end_time": datetime.now(),
-                                "job_id": job_id,
+                                "job_id": current_job_id,
                                 "hostname": last_known_hostname
                             })
-                            job_output_content.set(f"Slurm job {job_id} ended with state: {final_state}.\n\n{logs_combined_content}")
+                            job_output_content.set(f"Slurm job {current_job_id} ended with state: {final_state}.\n\n{logs_combined_content}")
                         else: # Any other truly unexpected or unknown state
                             job_info.set({
                                 "status": "No job launched", # Resets job_status_display to default
                                 "start_time": job_info.get()["start_time"],
                                 "end_time": datetime.now(),
-                                "job_id": job_id,
+                                "job_id": current_job_id,
                                 "hostname": last_known_hostname
                             })
-                            job_output_content.set(f"Slurm job {job_id} ended in unexpected state: {final_state}. "
-                                                  f"Please check Slurm logs directly on the cluster for job ID {job_id} and consult `sacct -j {job_id}`.\n\n{logs_combined_content}")
+                            job_output_content.set(f"Slurm job {current_job_id} ended in unexpected state: {final_state}. "
+                                                  f"Please check Slurm logs directly on the cluster for job ID {current_job_id} and consult `sacct -j {current_job_id}`.\n\n{logs_combined_content}")
                         break # Exit polling loop
 
                     # If not in a final state, wait a bit and re-check.
@@ -217,6 +247,28 @@ def server(input, output, session):
         except Exception as e:
             job_info.set({"status": "No job launched", "start_time": None, "end_time": None, "job_id": None, "hostname": "N/A"})
             job_output_content.set(f"An unexpected error occurred: {e}")
+        finally:
+            # Clean up the generated job script file
+            if os.path.exists(job_script_path):
+                try:
+                    os.remove(job_script_path)
+                    print(f"Cleaned up generated job script: {job_script_path}")
+                except Exception as e:
+                    print(f"Error cleaning up {job_script_path}: {e}")
+            
+            # Clean up the .out and .err files if a job ID was successfully obtained
+            if current_job_id:
+                output_file = f"shiny_sleep_job_{current_job_id}.out"
+                error_file = f"shiny_sleep_job_{current_job_id}.err"
+                
+                for f in [output_file, error_file]:
+                    if os.path.exists(f):
+                        try:
+                            os.remove(f)
+                            print(f"Cleaned up job log file: {f}")
+                        except Exception as e:
+                            print(f"Error cleaning up {f}: {e}")
+
 
 # --- Create the Shiny App instance ---
 app = App(app_ui, server)
